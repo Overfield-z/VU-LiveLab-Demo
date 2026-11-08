@@ -1,0 +1,67 @@
+{
+  "name": "my-first-vscode-extension",
+  "displayName": "my-first-vscode-extension",
+  "description": "",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.145.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "my-first-vscode-extension.helloWorld",
+        "title": "Hello World"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vuLiveLab",
+          "title": "VU LiveLab",
+          "icon": "./media/vu-livelab.svg"
+        }
+      ]
+    },
+    "views": {
+      "vuLiveLab": [
+        {
+          "type": "webview",
+          "id": "my-first-vscode-extension.questionView",
+          "name": "VU LiveLab"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "VU LiveLab",
+      "properties": {
+        "vuLiveLab.pythonCommand": {
+          "type": "string",
+          "default": "python",
+          "description": "Python command or executable path used to run the active Python file."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "pretest": "npm run lint",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.145.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "eslint": "^10.5.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
