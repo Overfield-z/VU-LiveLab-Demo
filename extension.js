@@ -3,24 +3,38 @@
 const vscode = require('vscode');
 const crypto = require('crypto');
 const path = require('path');
+const { isDeepStrictEqual } = require('util');
 const { spawn } = require('child_process');
 
 const QUESTION_VIEW_ID = 'my-first-vscode-extension.questionView';
 const PYTHON_TIMEOUT_MS = 5000;
 const MAX_OUTPUT_CHARS = 20000;
+const TRACE_PREFIX = '@@VULIVELAB_TRACE@@';
 
 const TASKS = [
 	{
 		title: 'ต่อท้าย List ด้วย mango',
 		prompt: 'สร้าง List ชื่อ fruits ที่มี "apple" และ "banana" เพิ่ม "mango" ไว้ท้าย List แล้วพิมพ์สมาชิก index 2',
 		hint: 'append() เพิ่มสมาชิกไว้ท้าย List และ index เริ่มนับจาก 0',
-		expectedOutput: 'mango'
+		expectedOutput: 'mango',
+		traceRequirements: {
+			variables: ['fruits'],
+			initial: { fruits: ['apple', 'banana'] },
+			afterLastLine: { fruits: ['apple', 'banana', 'mango'] },
+			requiredCalls: [{ name: 'append', receiver: 'fruits' }]
+		}
 	},
 	{
 		title: 'แทรก green ใน List',
 		prompt: 'สร้าง List ชื่อ colors ที่มี "red" และ "blue" แทรก "green" ที่ index 1 แล้วพิมพ์สมาชิก index 1',
 		hint: 'insert(1, "green") จะแทรก green ก่อนสมาชิกเดิมที่อยู่ index 1',
-		expectedOutput: 'green'
+		expectedOutput: 'green',
+		traceRequirements: {
+			variables: ['colors'],
+			initial: { colors: ['red', 'blue'] },
+			afterLastLine: { colors: ['red', 'green', 'blue'] },
+			requiredCalls: [{ name: 'insert', receiver: 'colors' }]
+		}
 	}
 ];
 
@@ -49,7 +63,7 @@ function activate(context) {
 	context.subscriptions.push(disposable);
 
 	// Register the provider that fills the VU LiveLab view in the Explorer sidebar.
-	const questionViewProvider = new QuestionViewProvider();
+	const questionViewProvider = new QuestionViewProvider(context);
 	context.subscriptions.push(
 		vscode.window.onDidChangeActiveTextEditor((editor) => questionViewProvider.trackEditor(editor))
 	);
@@ -59,10 +73,11 @@ function activate(context) {
 }
 
 class QuestionViewProvider {
-	constructor() {
+	constructor(context) {
 		this.webviewView = undefined;
 		this.taskIndex = 0;
 		this.pythonFileUri = undefined;
+		this.traceRunnerPath = context.asAbsolutePath(path.join('python', 'trace_runner.py'));
 		this.trackEditor(vscode.window.activeTextEditor);
 	}
 
@@ -96,7 +111,9 @@ class QuestionViewProvider {
 		} else if (message.type === 'showHint') {
 			this.postMessage({ type: 'hint', text: TASKS[this.taskIndex].hint });
 		} else if (message.type === 'checkCode') {
-			await this.checkCurrentCode();
+			await this.checkCurrentCode(false);
+		} else if (message.type === 'traceCode') {
+			await this.checkCurrentCode(true);
 		}
 	}
 
@@ -120,9 +137,9 @@ class QuestionViewProvider {
 		this.webviewView?.webview.postMessage(message);
 	}
 
-	async checkCurrentCode() {
+	async checkCurrentCode(showTrace = false) {
 		const task = TASKS[this.taskIndex];
-		this.postMessage({ type: 'checking' });
+		this.postMessage({ type: 'checking', traceMode: showTrace });
 
 		try {
 			if (!this.pythonFileUri) {
@@ -137,33 +154,120 @@ class QuestionViewProvider {
 			const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
 			const result = await this.runPythonFile(
 				document.uri.fsPath,
-				workspaceFolder?.uri.fsPath ?? path.dirname(document.uri.fsPath)
+				workspaceFolder?.uri.fsPath ?? path.dirname(document.uri.fsPath),
+				task.traceRequirements
 			);
 			const actualOutput = result.stdout.replace(/\r\n/g, '\n').trimEnd();
-			const passed = actualOutput === task.expectedOutput;
+			const traceResult = this.checkTraceRequirements(result.traceEvents, task.traceRequirements);
+			const passed = result.exitCode === 0
+				&& actualOutput === task.expectedOutput
+				&& traceResult.failures.length === 0;
+			const details = [result.stderr, ...traceResult.failures].filter(Boolean).join('\n');
 			this.postMessage({
 				type: 'result',
 				passed,
 				output: actualOutput,
-				detail: result.stderr
+				detail: details,
+				traceChecks: showTrace ? traceResult.checks : []
 			});
 		} catch (error) {
 			this.postMessage({
 				type: 'result',
 				passed: false,
 				output: '',
-				detail: error instanceof Error ? error.message : String(error)
+				detail: error instanceof Error ? error.message : String(error),
+				traceEvents: []
 			});
 		}
 	}
 
-	runPythonFile(filePath, cwd) {
+	checkTraceRequirements(events, requirements) {
+		const snapshots = events.filter((event) => event.event === 'line' || event.event === 'return');
+		const failures = [];
+		const checks = [];
+
+		for (const [name, expected] of Object.entries(requirements.initial)) {
+			const firstSnapshot = snapshots.find((event) => Object.hasOwn(event.variables, name));
+			const declaration = events.find((event) => event.event === 'variable-declaration' && event.name === name);
+			if (!firstSnapshot) {
+				const detail = `Trace ไม่พบตัวแปร "${name}" หลังประกาศ`;
+				failures.push(detail);
+				checks.push({
+					title: `ค่าเริ่มต้นของ ${name}`,
+					passed: false,
+					detail,
+					line: declaration?.line,
+					source: declaration?.source || '',
+					variables: {}
+				});
+			} else {
+				const actual = firstSnapshot.variables[name];
+				const passed = isDeepStrictEqual(actual, expected);
+				const detail = passed ? 'ค่าตรงตามโจทย์' : `คาดว่า ${JSON.stringify(expected)} แต่พบ ${JSON.stringify(actual)}`;
+				if (!passed) failures.push(`ค่าเริ่มต้นของ "${name}" ไม่ตรง (${detail})`);
+				checks.push({
+					title: `ค่าเริ่มต้นของ ${name}`,
+					passed,
+					detail,
+					line: declaration?.line ?? firstSnapshot.line,
+					source: declaration?.source || firstSnapshot.source,
+					variables: { [name]: actual }
+				});
+			}
+		}
+
+		const afterLastLine = [...events].reverse().find((event) => event.event === 'return' && event.scope === 'ไฟล์หลัก');
+		for (const [name, expected] of Object.entries(requirements.afterLastLine)) {
+			if (!afterLastLine || !Object.hasOwn(afterLastLine.variables, name)) {
+				const detail = `Trace ไม่พบตัวแปร "${name}" หลังบรรทัดสุดท้าย`;
+				failures.push(detail);
+				checks.push({ title: `หลังบรรทัดสุดท้าย: ${name}`, passed: false, detail, variables: {} });
+			} else {
+				const actual = afterLastLine.variables[name];
+				const passed = isDeepStrictEqual(actual, expected);
+				const detail = passed ? 'ค่าตรงตามโจทย์' : `คาดว่า ${JSON.stringify(expected)} แต่พบ ${JSON.stringify(actual)}`;
+				if (!passed) failures.push(`ค่าของ "${name}" หลังบรรทัดสุดท้ายไม่ตรง (${detail})`);
+				checks.push({
+					title: `หลังบรรทัดสุดท้าย: ${name}`,
+					passed,
+					detail,
+					line: afterLastLine.line,
+					source: afterLastLine.source,
+					variables: { [name]: actual }
+				});
+			}
+		}
+
+		for (const requiredCall of requirements.requiredCalls) {
+			const found = events.find((event) => event.event === 'required-call'
+				&& event.name === requiredCall.name
+				&& event.receiver === requiredCall.receiver);
+			const passed = Boolean(found?.found);
+			const detail = passed
+				? `พบการเรียก ${requiredCall.receiver}.${requiredCall.name}()`
+				: `ไม่พบการเรียก ${requiredCall.receiver}.${requiredCall.name}()`;
+			if (!passed) failures.push(detail);
+			checks.push({
+				title: `ตรวจการเรียก ${requiredCall.name}()`,
+				passed,
+				detail,
+				line: found?.line,
+				source: found?.source || ''
+			});
+		}
+		return { checks, failures };
+	}
+
+	runPythonFile(filePath, cwd, traceRequirements) {
 		const pythonCommand = vscode.workspace.getConfiguration('vuLiveLab').get('pythonCommand', 'python');
 
 		return new Promise((resolve, reject) => {
-			const child = spawn(pythonCommand, [filePath], { cwd, windowsHide: true });
+			const args = [this.traceRunnerPath, filePath, JSON.stringify(traceRequirements)];
+			const child = spawn(pythonCommand, args, { cwd, windowsHide: true });
 			let stdout = '';
 			let stderr = '';
+			let traceBuffer = '';
+			const traceEvents = [];
 			let timedOut = false;
 			let outputLimitReached = false;
 			let settled = false;
@@ -187,7 +291,46 @@ class QuestionViewProvider {
 			};
 
 			collect(child.stdout, () => stdout, (value) => { stdout = value; });
-			collect(child.stderr, () => stderr, (value) => { stderr = value; });
+			child.stderr.setEncoding('utf8');
+			child.stderr.on('data', (chunk) => {
+				traceBuffer += chunk;
+				const lines = traceBuffer.split(/\r?\n/);
+				traceBuffer = lines.pop() ?? '';
+				for (const line of lines) {
+					if (line.startsWith(TRACE_PREFIX)) {
+						try {
+							traceEvents.push(JSON.parse(line.slice(TRACE_PREFIX.length)));
+						} catch {
+							// Ignore malformed trace records and preserve normal program output.
+						}
+					} else {
+						const remaining = MAX_OUTPUT_CHARS - stderr.length;
+						stderr += line.slice(0, Math.max(0, remaining)) + '\n';
+						if (line.length > remaining) {
+							outputLimitReached = true;
+							child.kill();
+						}
+					}
+				}
+			});
+			child.stderr.on('end', () => {
+				if (traceBuffer) {
+					if (traceBuffer.startsWith(TRACE_PREFIX)) {
+						try {
+							traceEvents.push(JSON.parse(traceBuffer.slice(TRACE_PREFIX.length)));
+						} catch {
+							// Ignore malformed trace records.
+						}
+					} else {
+						const remaining = MAX_OUTPUT_CHARS - stderr.length;
+						stderr += traceBuffer.slice(0, Math.max(0, remaining));
+						if (traceBuffer.length > remaining) {
+							outputLimitReached = true;
+							child.kill();
+						}
+					}
+				}
+			});
 
 			child.on('error', (error) => {
 				if (settled) return;
@@ -205,10 +348,8 @@ class QuestionViewProvider {
 					reject(new Error('โปรแกรมใช้เวลานานเกิน 5 วินาที จึงหยุดการทำงาน'));
 				} else if (outputLimitReached) {
 					reject(new Error('โปรแกรมแสดงผลมากเกินไป จึงหยุดการทำงาน'));
-				} else if (code !== 0) {
-					reject(new Error(stderr.trim() || `Python จบการทำงานด้วยรหัส ${code}`));
 				} else {
-					resolve({ stdout, stderr });
+					resolve({ stdout, stderr, traceEvents, exitCode: code });
 				}
 			});
 		});
@@ -271,6 +412,9 @@ class QuestionViewProvider {
 				#result { min-height: 1.4em; margin-top: 12px; }
 				#fileName { color: var(--vscode-descriptionForeground); font-size: 11px; margin: 10px 0; }
 				#result { white-space: pre-wrap; }
+				#traceLog { max-height: 320px; overflow: auto; font-size: 11px; }
+				.trace-event { padding: 8px 0; border-top: 1px solid var(--vscode-panel-border); }
+				.trace-event code { color: var(--vscode-textLink-foreground); }
 				.navigation { display: flex; justify-content: space-between; gap: 8px; }
 				button:disabled { opacity: 0.5; cursor: default; }
 			</style>
@@ -281,11 +425,16 @@ class QuestionViewProvider {
 			<section class="card">
 				<div id="progress" class="eyebrow"></div>
 				<p id="prompt"></p>
-				<p>เปิดไฟล์ Python (.py) ใน Editor เขียนคำตอบ แล้วกดตรวจโค้ด</p>
+				<p>เปิดไฟล์ Python (.py) ใน Editor แล้วกดตรวจโค้ด หรือดูผล Trace ของจุดตรวจ</p>
 				<div id="fileName">ไฟล์ Python: ยังไม่ได้เลือก</div>
 				<button id="check">ตรวจโค้ด</button>
+				<button id="trace" class="secondary">Trace ทีละบรรทัด</button>
 				<button id="hint" class="secondary">คำใบ้</button>
 				<div id="result" role="status" aria-live="polite"></div>
+				<details id="traceDetails" hidden>
+					<summary>ดู 3 จุดตรวจของ Trace</summary>
+					<div id="traceLog"></div>
+				</details>
 				<div class="navigation">
 					<button id="previous" class="secondary">ข้อก่อนหน้า</button>
 					<button id="next">ข้อถัดไป</button>
@@ -294,8 +443,11 @@ class QuestionViewProvider {
 			<script nonce="${nonce}">
 				const vscode = acquireVsCodeApi();
 				const result = document.getElementById('result');
+				const traceDetails = document.getElementById('traceDetails');
+				const traceLog = document.getElementById('traceLog');
 				const send = (type) => vscode.postMessage({ type });
 				document.getElementById('check').addEventListener('click', () => send('checkCode'));
+				document.getElementById('trace').addEventListener('click', () => send('traceCode'));
 				document.getElementById('hint').addEventListener('click', () => {
 					send('showHint');
 				});
@@ -310,16 +462,45 @@ class QuestionViewProvider {
 						document.getElementById('previous').disabled = message.index === 0;
 						document.getElementById('next').disabled = message.index === message.total - 1;
 						result.textContent = '';
+						traceDetails.hidden = true;
+						traceLog.replaceChildren();
 					} else if (message.type === 'activeFile') {
 						document.getElementById('fileName').textContent = message.fileName
 							? 'ไฟล์ Python: ' + message.fileName
 							: 'ไฟล์ Python: ยังไม่ได้เปิดไฟล์ .py';
 					} else if (message.type === 'checking') {
-						result.textContent = 'กำลังบันทึกและรันไฟล์ Python...';
+						result.textContent = message.traceMode
+							? 'กำลังรัน Python และเก็บสถานะตัวแปร...'
+							: 'กำลังบันทึกและรันไฟล์ Python...';
+						traceDetails.hidden = true;
+						traceLog.replaceChildren();
 					} else if (message.type === 'result') {
 						const output = message.output ? '\\nผลลัพธ์: ' + message.output : '';
 						const detail = message.detail ? '\\n' + message.detail : '';
 						result.textContent = (message.passed ? '✅ ผ่าน!' : '❌ ยังไม่ผ่าน') + output + detail;
+						if (message.traceChecks?.length) {
+							traceDetails.hidden = false;
+							for (const item of message.traceChecks) {
+								const row = document.createElement('div');
+								row.className = 'trace-event';
+								const label = document.createElement('strong');
+								label.textContent = (item.passed ? '✅ ' : '❌ ') + item.title
+									+ (item.line ? ' · บรรทัด ' + item.line : '');
+								const source = document.createElement('div');
+								const code = document.createElement('code');
+								code.textContent = item.source || '(ไม่พบ source code ที่ตรงกับเกณฑ์)';
+								source.appendChild(code);
+								const detail = document.createElement('div');
+								detail.textContent = item.detail;
+								row.append(label, source, detail);
+								if (item.variables && Object.keys(item.variables).length) {
+									const state = document.createElement('pre');
+									state.textContent = JSON.stringify(item.variables, null, 2);
+									row.appendChild(state);
+								}
+								traceLog.appendChild(row);
+							}
+						}
 					} else if (event.data.type === 'hint') {
 						result.textContent = 'คำใบ้: ' + message.text;
 					}
